@@ -11,7 +11,7 @@
 # and definitions of Ansi C types in Nim syntax
 # All symbols are prefixed with 'c_' to avoid ambiguities
 
-{.push hints:off, stack_trace: off, profiler: off.}
+{.push hints:off, stack_trace: off, profiler: off, raises: [].}
 
 proc c_memchr*(s: pointer, c: cint, n: csize_t): pointer {.
   importc: "memchr", header: "<string.h>".}
@@ -27,6 +27,8 @@ proc c_strcmp*(a, b: cstring): cint {.
   importc: "strcmp", header: "<string.h>", noSideEffect.}
 proc c_strlen*(a: cstring): csize_t {.
   importc: "strlen", header: "<string.h>", noSideEffect.}
+proc c_strstr*(haystack, needle: cstring): cstring {.
+    importc: "strstr", header: "<string.h>", noSideEffect.}
 proc c_abort*() {.
   importc: "abort", header: "<stdlib.h>", noSideEffect, noreturn.}
 
@@ -54,7 +56,7 @@ when defined(windows):
     SIGTERM = cint(15)
     SIG_DFL* = cast[CSighandlerT](0)
 elif defined(macosx) or defined(linux) or defined(freebsd) or
-     defined(openbsd) or defined(netbsd) or defined(solaris) or
+     defined(openbsd) or defined(netbsd) or defined(sunos) or
      defined(dragonfly) or defined(nintendoswitch) or defined(genode) or
      defined(aix) or hostOS == "standalone":
   const
@@ -65,7 +67,7 @@ elif defined(macosx) or defined(linux) or defined(freebsd) or
     SIGSEGV* = cint(11)
     SIGTERM* = cint(15)
     SIGPIPE* = cint(13)
-    SIG_DFL* = cast[CSighandlerT](0)
+    SIG_DFL* = CSighandlerT(nil)
 elif defined(haiku):
   const
     SIGABRT* = cint(6)
@@ -75,20 +77,15 @@ elif defined(haiku):
     SIGSEGV* = cint(11)
     SIGTERM* = cint(15)
     SIGPIPE* = cint(7)
-    SIG_DFL* = cast[CSighandlerT](0)
-else:
-  when defined(nimscript):
-    {.error: "SIGABRT not ported to your platform".}
-  else:
-    var
-      SIGINT* {.importc: "SIGINT", nodecl.}: cint
-      SIGSEGV* {.importc: "SIGSEGV", nodecl.}: cint
-      SIGABRT* {.importc: "SIGABRT", nodecl.}: cint
-      SIGFPE* {.importc: "SIGFPE", nodecl.}: cint
-      SIGILL* {.importc: "SIGILL", nodecl.}: cint
-      SIG_DFL* {.importc: "SIG_DFL", nodecl.}: CSighandlerT
-    when defined(macosx) or defined(linux):
-      var SIGPIPE* {.importc: "SIGPIPE", nodecl.}: cint
+    SIG_DFL* = CSighandlerT(nil)
+elif not defined(nimscript):
+  var
+    SIGINT* {.importc: "SIGINT", nodecl.}: cint
+    SIGSEGV* {.importc: "SIGSEGV", nodecl.}: cint
+    SIGABRT* {.importc: "SIGABRT", nodecl.}: cint
+    SIGFPE* {.importc: "SIGFPE", nodecl.}: cint
+    SIGILL* {.importc: "SIGILL", nodecl.}: cint
+    SIG_DFL* {.importc: "SIG_DFL", nodecl.}: CSighandlerT
 
 when defined(macosx):
   const SIGBUS* = cint(10)
@@ -157,9 +154,13 @@ proc c_signal*(sign: cint, handler: CSighandlerT): CSighandlerT {.
   importc: "signal", header: "<signal.h>", discardable.}
 proc c_raise*(sign: cint): cint {.importc: "raise", header: "<signal.h>".}
 
+when defined(musl):
+  type CFile {.importc: "FILE", header: "<stdio.h>",
+    incompleteStruct, byref.} = object
+else:
+  type CFile {.importc: "FILE", header: "<stdio.h>",
+    incompleteStruct.} = object
 type
-  CFile {.importc: "FILE", header: "<stdio.h>",
-          incompleteStruct.} = object
   CFilePtr* = ptr CFile ## The type representing a file handle.
 
 # duplicated between io and ansi_c
@@ -180,10 +181,15 @@ proc c_printf*(frmt: cstring): cint {.
 
 proc c_fputs*(c: cstring, f: CFilePtr): cint {.
   importc: "fputs", header: "<stdio.h>", discardable.}
+proc c_fputc*(c: char, f: CFilePtr): cint {.
+  importc: "fputc", header: "<stdio.h>", discardable.}
 
 proc c_sprintf*(buf, frmt: cstring): cint {.
   importc: "sprintf", header: "<stdio.h>", varargs, noSideEffect.}
   # we use it only in a way that cannot lead to security issues
+
+proc c_snprintf*(buf: cstring, n: csize_t, frmt: cstring): cint {.
+  importc: "snprintf", header: "<stdio.h>", varargs, noSideEffect.}
 
 when defined(zephyr) and not defined(zephyrUseLibcMalloc):
   proc c_malloc*(size: csize_t): pointer {.
@@ -209,10 +215,10 @@ else:
   proc c_realloc*(p: pointer, newsize: csize_t): pointer {.
     importc: "realloc", header: "<stdlib.h>".}
 
-proc c_fwrite*(buf: pointer, size, n: csize_t, f: CFilePtr): cint {.
+proc c_fwrite*(buf: pointer, size, n: csize_t, f: CFilePtr): csize_t {.
   importc: "fwrite", header: "<stdio.h>".}
 
-proc c_fflush(f: CFilePtr): cint {.
+proc c_fflush*(f: CFilePtr): cint {.
   importc: "fflush", header: "<stdio.h>".}
 
 proc rawWriteString*(f: CFilePtr, s: cstring, length: int) {.compilerproc, nonReloadable, inline.} =
@@ -222,7 +228,7 @@ proc rawWriteString*(f: CFilePtr, s: cstring, length: int) {.compilerproc, nonRe
 
 proc rawWrite*(f: CFilePtr, s: cstring) {.compilerproc, nonReloadable, inline.} =
   # we cannot throw an exception here!
-  discard c_fwrite(s, 1, cast[csize_t](s.len), f)
+  discard c_fwrite(s, 1, c_strlen(s), f)
   discard c_fflush(f)
 
 {.pop.}

@@ -13,10 +13,10 @@
 
 {.deprecated.}
 
-{.push stackTrace: off.}
+{.push stackTrace: off, checks: off.}
 
 import
-  locks
+  std/locks
 
 const
   ElemsPerNode = 100

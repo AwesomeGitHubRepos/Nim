@@ -1,5 +1,5 @@
 discard """
-  matrix: "--gc:refc; --gc:arc"
+  matrix: "--mm:refc; --mm:orc"
   input: "Arne"
   output: '''
 Hello! What is your name?
@@ -16,7 +16,7 @@ GROOT
 """
 
 
-import streams
+import std/[syncio, streams, assertions]
 
 
 block tstreams:
@@ -50,6 +50,12 @@ block tstreams3:
       echo line
     s.close
 
+
+block:
+  let fs = newFileStream("amissingfile.txt")
+  defer: fs.close()
+  doAssert isNil(fs)
+
 # bug #12410
 
 var a = newStringStream "hehohihahuhyh"
@@ -81,7 +87,35 @@ block:
   ss.setPosition(0)
   doAssert(ss.peekStr(5) == "hello")
 
+# bug #26088 - Overwriting a string stream must not truncate it
+block:
+  var short = newStringStream("0123456789ABCDEF")
+  short.setPosition(0)
+  short.write("XX")
+  doAssert short.data == "XX23456789ABCDEF"
+  doAssert not short.atEnd
+
+  var long = newStringStream("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+  long.setPosition(0)
+  long.write("XX")
+  doAssert long.data == "XX23456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  doAssert not long.atEnd
+
 # bug #19716
 static: # Ensure streams it doesnt break with nimscript on arc/orc #19716
   let s = newStringStream("a")
   doAssert s.data == "a"
+
+static: # issue #24054, readStr
+  var s = newStringStream("foo bar baz")
+  doAssert s.readStr(3) == "foo"
+
+template main =
+  var strm = newStringStream("abcde")
+  var buffer = "12345"
+  doAssert strm.readDataStr(buffer, 0..3) == 4
+  doAssert buffer == "abcd5"
+  strm.close()
+
+static: main()
+main()

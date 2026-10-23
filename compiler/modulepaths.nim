@@ -7,8 +7,10 @@
 #    distribution, for details about the copyright.
 #
 
-import ast, renderer, strutils, msgs, options, idents, os, lineinfos,
+import ast, renderer, msgs, options, idents, lineinfos,
   pathutils
+
+import std/[strutils, os]
 
 proc getModuleName*(conf: ConfigRef; n: PNode): string =
   # This returns a short relative module name without the nim extension
@@ -36,11 +38,18 @@ proc getModuleName*(conf: ConfigRef; n: PNode): string =
           localError(n.info, "only '/' supported with $package notation")
           result = ""
     else:
-      let modname = getModuleName(conf, n[2])
-      # hacky way to implement 'x / y /../ z':
-      result = getModuleName(conf, n1)
-      result.add renderTree(n0, {renderNoComments}).replace(" ")
-      result.add modname
+      if n0.kind in nkIdentKinds:
+        let ident = n0.getPIdent
+        if ident != nil and ident.s[0] == '/':
+          let modname = getModuleName(conf, n[2])
+          # hacky way to implement 'x / y /../ z':
+          result = getModuleName(conf, n1)
+          result.add renderTree(n0, {renderNoComments}).replace(" ")
+          result.add modname
+        else:
+          result = ""
+      else:
+        result = ""
   of nkPrefix:
     when false:
       if n[0].kind == nkIdent and n[0].ident.s == "$":
@@ -70,6 +79,10 @@ proc checkModuleName*(conf: ConfigRef; n: PNode; doLocalError=true): FileIndex =
   else:
     result = fileInfoIdx(conf, fullPath)
 
+type
+  SelectedBase = enum
+    FromProject, FromSearchPath, FromNimblePath
+
 proc mangleModuleName*(conf: ConfigRef; path: AbsoluteFile): string =
   ## Mangle a relative module path to avoid path and symbol collisions.
   ##
@@ -78,9 +91,29 @@ proc mangleModuleName*(conf: ConfigRef; path: AbsoluteFile): string =
   ##
   ## Example:
   ## `foo-#head/../bar` becomes `@foo-@hhead@s..@sbar`
-  "@m" & relativeTo(path, conf.projectPath).string.multiReplace(
-    {$os.DirSep: "@s", $os.AltSep: "@s", "#": "@h", "@": "@@", ":": "@c"})
+  var best = relativeTo(path, conf.projectPath).string
+  var selectedBase = FromProject
+  for x in conf.searchPaths:
+    let other = relativeTo(path, x).string
+    if other.len < best.len:
+      best = other
+      selectedBase = FromSearchPath
+  for x in conf.nimblePaths:
+    let other = relativeTo(path, x).string
+    if other.len < best.len:
+      best = other
+      selectedBase = FromNimblePath
+  let prefix =
+    case selectedBase
+    of FromProject: "@m"
+    of FromSearchPath: "@p"
+    of FromNimblePath: "@n"
+
+  # Note: We encode ".." specially as "@d" to avoid issues with changeFileExt
+  # which would misinterpret ".." as "name.ext" and strip the second part.
+  prefix & best.multiReplace(
+    {"..": "@d", $os.DirSep: "@s", $os.AltSep: "@s", "#": "@h", "@": "@@", ":": "@c"})
 
 proc demangleModuleName*(path: string): string =
   ## Demangle a relative module path.
-  result = path.multiReplace({"@@": "@", "@h": "#", "@s": "/", "@m": "", "@c": ":"})
+  result = path.multiReplace({"@@": "@", "@d": "..", "@h": "#", "@s": "/", "@m": "", "@p": "", "@n": "", "@c": ":"})

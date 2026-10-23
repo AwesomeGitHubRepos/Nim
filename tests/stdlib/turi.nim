@@ -1,10 +1,12 @@
 discard """
+  matrix: "--mm:refc; --mm:orc"
   targets:  "c js"
 """
 
 import std/uri
 from std/uri {.all.} as uri2 import removeDotSegments
 from std/sequtils import toSeq
+import std/assertions
 
 template main() =
   block: # encodeUrl, decodeUrl
@@ -287,6 +289,15 @@ template main() =
       var foo = parseUri("http://example.com") / "foo" ? {"do": "do", "bar": ""}
       var foo1 = parseUri("http://example.com/foo?do=do&bar")
       doAssert foo == foo1
+    block: # issue #19782: appends to existing query string
+      var foo = parseUri("http://example.com/foo?existing=1") ? {"bar": "qux"}
+      doAssert $foo == "http://example.com/foo?existing=1&bar=qux"
+    block: # issue #19782: empty params list preserves existing query
+      var foo = parseUri("http://example.com/foo?existing=1") ? {:}
+      doAssert $foo == "http://example.com/foo?existing=1"
+    block: # issue #19782: empty params on uri without query is a no-op
+      var foo = parseUri("http://example.com/foo") ? {:}
+      doAssert $foo == "http://example.com/foo"
 
   block: # getDataUri, dataUriBase64
     doAssert getDataUri("", "text/plain") == "data:text/plain;charset=utf-8;base64,"
@@ -305,6 +316,9 @@ template main() =
     doAssert toSeq(decodeQuery("a=1;b=0", sep = ';')) == @[("a", "1"), ("b", "0")]
     doAssert toSeq(decodeQuery("a=1&b=2c=6")) == @[("a", "1"), ("b", "2c=6")]
     doAssert toSeq(decodeQuery("a=1;b=2c=6", sep = ';')) == @[("a", "1"), ("b", "2c=6")]
+    doAssert toSeq(decodeQuery("a;b", sep = ';')) == @[("a", ""), ("b", "")]
+    doAssert toSeq(decodeQuery("a;b=2;c", sep = ';')) == @[("a", ""), ("b", "2"), ("c", "")]
+    doAssert toSeq(decodeQuery("a=b&c;d=e", sep = ';')) == @[("a", "b&c"), ("d", "e")]
 
   block: # bug #17481
     let u1 = parseUri("./")

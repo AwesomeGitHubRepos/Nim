@@ -7,7 +7,7 @@
 #    distribution, for details about the copyright.
 #
 
-import posix
+import std/posix
 
 type
   Speed* = cuint
@@ -237,8 +237,8 @@ proc tcFlow*(fd: cint; action: cint): cint {.importc: "tcflow",
     header: "<termios.h>".}
 # Get process group ID for session leader for controlling terminal FD.
 
-# Window size ioctl.  Solaris based systems have an uncommen place for this.
-when defined(solaris) or defined(sunos):
+# Window size ioctl. SunOS systems have an uncommon place for this.
+when defined(sunos):
   var TIOCGWINSZ*{.importc, header: "<sys/termios.h>".}: culong
 else:
   var TIOCGWINSZ*{.importc, header: "<sys/ioctl.h>".}: culong

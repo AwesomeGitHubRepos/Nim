@@ -445,3 +445,44 @@ static:
         needSecondIdentifier.mgetOrPut(firstPart, @[]).add((name, pattern))
 
     doAssert needSecondIdentifier[0] == @[("aaaa", "bbbb"), ("aaaaa", "bbbbb"), ("aaaaaa", "bbbbbb"), ("aaaaaaa", "bbbbbbb"), ("aaaaaaaa", "bbbbb")]
+
+# bug #17864
+macro transform*(fn: typed) =
+  quote do:
+    `fn`
+
+var map: Table[string, HashSet[string]]
+proc publish*(): void {.transform.} =
+  map["k"] = init_hash_set[string]()
+  map["k"].incl "d"
+
+publish()
+
+
+iterator it(x: var int): var int =
+  yield x
+
+proc it(x: var int): var int =
+  x
+
+proc xxx() =
+  type Obj = object
+    field: ref int
+  var obj = Obj(field: new(int))
+  obj.field[] = 123
+  assert it(obj.field[]) == 123 # fails
+  for x in it(obj.field[]): # fails
+    assert x == 123
+
+static:
+  xxx()
+
+xxx()
+
+
+static:
+  var foo: string
+  for _ in 0 ..< 100_000:
+    foo.add 'a'
+  doAssert repr(foo).len == 100_002
+

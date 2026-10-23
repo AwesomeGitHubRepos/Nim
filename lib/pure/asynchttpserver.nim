@@ -39,10 +39,13 @@ runnableExamples("-r:off"):
 
   waitFor main()
 
-import asyncnet, asyncdispatch, parseutils, uri, strutils
-import httpcore
-from nativesockets import getLocalAddr, Domain, AF_INET, AF_INET6
+import std/[asyncnet, asyncdispatch, parseutils, uri, strutils]
+import std/httpcore
+from std/nativesockets import getLocalAddr, Domain, AF_INET, AF_INET6
 import std/private/since
+
+when defined(nimPreviewSlimSystem):
+  import std/assertions
 
 export httpcore except parseHeader
 
@@ -68,7 +71,8 @@ type
     socket: AsyncSocket
     reuseAddr: bool
     reusePort: bool
-    maxBody: int ## The maximum content-length that will be read for the body.
+    maxBody: int ## The maximum number of bytes that will be read for the body.
+    readTimeout: int ## Milliseconds a request may take to arrive; 0 or less: no limit.
     maxFDs: int
 
 proc getPort*(self: AsyncHttpServer): Port {.since: (1, 5, 1).} =
@@ -85,9 +89,25 @@ proc getPort*(self: AsyncHttpServer): Port {.since: (1, 5, 1).} =
   result = getLocalAddr(self.socket)[1]
 
 proc newAsyncHttpServer*(reuseAddr = true, reusePort = false,
-                         maxBody = 8388608): AsyncHttpServer =
+                         maxBody = 8388608, readTimeout = 0): AsyncHttpServer =
   ## Creates a new `AsyncHttpServer` instance.
-  result = AsyncHttpServer(reuseAddr: reuseAddr, reusePort: reusePort, maxBody: maxBody)
+  ##
+  ## `readTimeout` is the number of milliseconds a client has to deliver a
+  ## complete request: the request line, the headers and the body. The time
+  ## starts when the server begins waiting for the request, so on a keep-alive
+  ## connection it also limits how long the connection may sit idle between
+  ## requests. A client that sends its bytes slowly, or not at all, therefore
+  ## cannot hold a connection longer than that.
+  ##
+  ## When the time is up the connection is closed. If the request line had been
+  ## received by then, the client first gets a `408 Request Timeout` response;
+  ## otherwise it is closed without a response, as nothing was asked yet.
+  ## The time the callback takes to handle a request is not limited.
+  ##
+  ## A `readTimeout` of 0 (the default) or less means that the server waits for
+  ## requests for as long as it takes. `readTimeout` was added in version 2.3.1.
+  result = AsyncHttpServer(reuseAddr: reuseAddr, reusePort: reusePort,
+                           maxBody: maxBody, readTimeout: readTimeout)
 
 proc addHeaders(msg: var string, headers: HttpHeaders) =
   for k, v in headers:
@@ -107,16 +127,16 @@ proc respond*(req: Request, code: HttpCode, content: string,
   ## This procedure will **not** close the client socket.
   ##
   ## Example:
-  ##
-  ## .. code-block:: Nim
-  ##    import std/json
-  ##    proc handler(req: Request) {.async.} =
-  ##      if req.url.path == "/hello-world":
-  ##        let msg = %* {"message": "Hello World"}
-  ##        let headers = newHttpHeaders([("Content-Type","application/json")])
-  ##        await req.respond(Http200, $msg, headers)
-  ##      else:
-  ##        await req.respond(Http404, "Not Found")
+  ##   ```Nim
+  ##   import std/json
+  ##   proc handler(req: Request) {.async.} =
+  ##     if req.url.path == "/hello-world":
+  ##       let msg = %* {"message": "Hello World"}
+  ##       let headers = newHttpHeaders([("Content-Type","application/json")])
+  ##       await req.respond(Http200, $msg, headers)
+  ##     else:
+  ##       await req.respond(Http404, "Not Found")
+  ##   ```
   var msg = "HTTP/1.1 " & $code & "\c\L"
 
   if headers != nil:
@@ -143,19 +163,22 @@ proc respondError(req: Request, code: HttpCode): Future[void] =
   result = req.client.send(msg)
 
 proc parseProtocol(protocol: string): tuple[orig: string, major, minor: int] =
+  result = default(tuple[orig: string, major, minor: int])
   var i = protocol.skipIgnoreCase("HTTP/")
   if i != 5:
     raise newException(ValueError, "Invalid request protocol. Got: " &
         protocol)
   result.orig = protocol
-  i.inc protocol.parseSaturatedNatural(result.major, i)
-  i.inc # Skip .
-  i.inc protocol.parseSaturatedNatural(result.minor, i)
+  var n = protocol.parseSaturatedNatural(result.major, i)
+  i.inc n
+  if i < protocol.len and protocol[i] == '.':
+    inc i
+    n = protocol.parseSaturatedNatural(result.minor, i)
 
 proc sendStatus(client: AsyncSocket, status: string): Future[void] =
   client.send("HTTP/1.1 " & status & "\c\L\c\L")
 
-func hasChunkedEncoding(request: Request): bool = 
+func hasChunkedEncoding(request: Request): bool =
   ## Searches for a chunked transfer encoding
   const transferEncoding = "Transfer-Encoding"
 
@@ -170,7 +193,7 @@ proc processRequest(
   server: AsyncHttpServer,
   req: FutureVar[Request],
   client: AsyncSocket,
-  address: string,
+  address: sink string,
   lineFut: FutureVar[string],
   callback: proc (request: Request): Future[void] {.closure, gcsafe.},
 ): Future[bool] {.async.} =
@@ -179,12 +202,27 @@ proc processRequest(
   template request(): Request =
     req.mget()
 
+  # One timer bounds the request from the moment we start waiting for it until
+  # its last byte, so that sending it in dribs does not extend the time.
+  # `nil` when the server has no `readTimeout`.
+  let expiry = if server.readTimeout > 0: sleepAsync(server.readTimeout) else: nil
+
+  template expired(read: untyped): bool =
+    ## Whether `expiry` passed before `read` finished. `read` is then still
+    ## pending: closing `client` ends it, and nothing waits for its outcome.
+    if not expiry.isNil:
+      await (read or expiry)
+    not expiry.isNil and not read.finished
+
   # GET /path HTTP/1.1
   # Header: val
   # \n
   request.headers.clear()
   request.body = ""
-  request.hostname.shallowCopy(address)
+  when defined(gcArc) or defined(gcOrc) or defined(gcAtomicArc) or defined(gcYrc):
+    request.hostname = address
+  else:
+    request.hostname.shallowCopy(address)
   assert client != nil
   request.client = client
 
@@ -193,7 +231,12 @@ proc processRequest(
   for i in 0..1:
     lineFut.mget().setLen(0)
     lineFut.clean()
-    await client.recvLineInto(lineFut, maxLength = maxLine) # TODO: Timeouts.
+    let reading = client.recvLineInto(lineFut, maxLength = maxLine)
+    if expired(reading):
+      # No request line yet: nothing has been asked, so there is nothing to answer.
+      client.close()
+      return false
+    await reading
 
     if lineFut.mget == "":
       client.close()
@@ -246,7 +289,11 @@ proc processRequest(
     i = 0
     lineFut.mget.setLen(0)
     lineFut.clean()
-    await client.recvLineInto(lineFut, maxLength = maxLine)
+    let reading = client.recvLineInto(lineFut, maxLength = maxLine)
+    if expired(reading):
+      await request.respondError(Http408)
+      client.close(); return false
+    await reading
 
     if lineFut.mget == "":
       client.close(); return false
@@ -281,7 +328,11 @@ proc processRequest(
       if contentLength > server.maxBody:
         await request.respondError(Http413)
         return false
-      request.body = await client.recv(contentLength)
+      let body = client.recv(contentLength)
+      if expired(body):
+        await request.respondError(Http408)
+        return false
+      request.body = await body
       if request.body.len != contentLength:
         await request.respond(Http400, "Bad Request. Content-Length does not match actual.")
         return true
@@ -294,12 +345,16 @@ proc processRequest(
     while true:
       lineFut.mget.setLen(0)
       lineFut.clean()
-      
+
       # The encoding format alternates between specifying a number of bytes to read
       # and the data to be read, of the previously specified size
       if sizeOrData mod 2 == 0:
         # Expect a number of chars to read
-        await client.recvLineInto(lineFut, maxLength = maxLine)
+        let reading = client.recvLineInto(lineFut, maxLength = maxLine)
+        if expired(reading):
+          await request.respondError(Http408)
+          return false
+        await reading
         try:
           bytesToRead = lineFut.mget.parseHexInt
         except ValueError:
@@ -307,16 +362,28 @@ proc processRequest(
           await request.respond(Http411, ("Invalid chunked transfer encoding - " &
                                           "chunk data size must be hex encoded"))
           return true
+        if request.body.len > server.maxBody or bytesToRead < 0 or
+            bytesToRead > server.maxBody - request.body.len:
+          await request.respondError(Http413)
+          return false
       else:
         if bytesToRead == 0:
           # Done reading chunked data
           break
 
         # Read bytesToRead and add to body
-        let chunk = await client.recv(bytesToRead)
+        let reading = client.recv(bytesToRead)
+        if expired(reading):
+          await request.respondError(Http408)
+          return false
+        let chunk = await reading
         request.body.add(chunk)
         # Skip \r\n (chunk terminating bytes per spec)
-        let separator = await client.recv(2)
+        let separatorRead = client.recv(2)
+        if expired(separatorRead):
+          await request.respondError(Http408)
+          return false
+        let separator = await separatorRead
         if separator != "\r\n":
           await request.respond(Http400, "Bad Request. Encoding separator must be \\r\\n")
           return true
@@ -381,8 +448,9 @@ proc listen*(server: AsyncHttpServer; port: Port; address = ""; domain = AF_INET
   server.socket = newAsyncSocket(domain)
   if server.reuseAddr:
     server.socket.setSockOpt(OptReuseAddr, true)
-  if server.reusePort:
-    server.socket.setSockOpt(OptReusePort, true)
+  when not defined(nuttx):
+    if server.reusePort:
+      server.socket.setSockOpt(OptReusePort, true)
   server.socket.bindAddr(port, address)
   server.socket.listen()
 
